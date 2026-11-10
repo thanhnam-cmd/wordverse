@@ -244,6 +244,8 @@ body.dragging::after{content:'🪐 Thả file vào đây!';position:fixed;inset:
           <input class="title-input" id="titleInput" placeholder="Tên bài học">
           <div class="toolbar">
             <button class="btn cyan" id="presentBtn">📽️ Trình chiếu</button>
+            <button class="btn" id="addPicsBtn" title="Thêm ảnh có hình + tên từ (VD trang VOCABULARY) vào bài này">🖼️ Thêm ảnh từ vựng</button>
+            <button class="btn" id="enrichBtn" title="Tự tra phiên âm và nghĩa tiếng Việt cho thẻ còn trống">✨ Điền phiên âm & nghĩa</button>
             <button class="btn" id="videoBtn">🎬 Xuất video</button>
             <button class="btn danger" id="delLessonBtn" title="Xoá bài học">🗑️</button>
           </div>
@@ -459,7 +461,7 @@ function visualEl(w,lesson){
   (async()=>{
     const src=await resolveSrc(w,lesson);
     const img=src?await loadImg(src,!w.custom&&m==='ai'):null;
-    if(img){img.alt=w.word;d.innerHTML='';d.appendChild(img)}else if(d.isConnected)d.replaceWith(fallbackEl(w));else d.innerHTML='',d.appendChild(fallbackEl(w));
+    if(img){img.alt=w.word;if(w.custom){img.style.objectFit='contain';img.style.padding='6%';d.style.background='#fff'}d.innerHTML='';d.appendChild(img)}else if(d.isConnected)d.replaceWith(fallbackEl(w));else d.innerHTML='',d.appendChild(fallbackEl(w));
   })();
   return d;
 }
@@ -672,12 +674,163 @@ async function parseDocx(file){
 
 /* ---------- Picture files: match by file name, otherwise read the text in the picture (OCR) ---------- */
 const normName=s=>s.toLowerCase().replace(/\.[^.]+$/,'').replace(/[_\-.]+/g,' ').replace(/^\s*\d+\s*/,'').replace(/[?!,]/g,'').replace(/\s+/g,' ').trim();
-let ocrWorker=null;
-async function ocrImage(file,onProgress){
-  await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js');
-  if(!ocrWorker)ocrWorker=await Tesseract.createWorker(['eng','vie'],1,{logger:m=>{if(m.status==='recognizing text'&&onProgress)onProgress(m.progress)}});
-  const {data}=await ocrWorker.recognize(file);
+const TESS_URL='https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+let ocrWorker=null,sheetWorker=null,ocrProgress=null;
+const ocrLogger=m=>{if(m.status==='recognizing text'&&ocrProgress)ocrProgress(m.progress)};
+async function ocrImage(src){        // written word lists: "apple : quả táo" (English + Vietnamese)
+  await loadScript(TESS_URL);
+  if(!ocrWorker)ocrWorker=await Tesseract.createWorker(['eng','vie'],1,{logger:ocrLogger});
+  const {data}=await ocrWorker.recognize(src);
   return fromText(data.text.replace(/[|]/g,' '));
+}
+async function fileToCanvas(file,max=2400){
+  const url=URL.createObjectURL(file);
+  try{
+    const img=await new Promise((ok,no)=>{const i=new Image();i.onload=()=>ok(i);i.onerror=()=>no(new Error('Không mở được ảnh'));i.src=url});
+    const s=Math.min(1,max/Math.max(img.naturalWidth,img.naturalHeight));
+    const cv=document.createElement('canvas');cv.width=Math.round(img.naturalWidth*s);cv.height=Math.round(img.naturalHeight*s);
+    const ctx=cv.getContext('2d',{willReadFrequently:true});ctx.fillStyle='#fff';ctx.fillRect(0,0,cv.width,cv.height);ctx.drawImage(img,0,0,cv.width,cv.height);
+    return {cv,ctx};
+  }finally{URL.revokeObjectURL(url)}
+}
+const median=a=>{if(!a.length)return 0;const s=[...a].sort((x,y)=>x-y);return s[Math.floor(s.length/2)]};
+// group OCR words that sit on one line close together into labels ("table" + "tennis" → "table tennis")
+function wordsToLabels(words){
+  const ws=words.filter(w=>w.confidence>=75&&w.text.trim()).map(w=>({t:w.text.trim(),x0:w.bbox.x0,y0:w.bbox.y0,x1:w.bbox.x1,y1:w.bbox.y1}))
+    .sort((a,b)=>a.x0-b.x0);
+  const labels=[];
+  for(const w of ws){
+    const h=w.y1-w.y0;
+    const L=labels.find(L=>{const lh=L.y1-L.y0,ov=Math.min(L.y1,w.y1)-Math.max(L.y0,w.y0),gap=w.x0-L.x1;
+      return ov>0.5*Math.min(lh,h)&&gap>-h*0.3&&gap<h*1.1&&Math.max(lh,h)/Math.min(lh,h)<1.7});
+    if(L){L.t+=' '+w.t;L.x1=Math.max(L.x1,w.x1);L.y0=Math.min(L.y0,w.y0);L.y1=Math.max(L.y1,w.y1)}
+    else labels.push({...w});
+  }
+  labels.forEach(L=>{L.t=L.t.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9?!.)]+$/g,'').replace(/\s+/g,' ').trim();L.h=L.y1-L.y0;L.cx=(L.x0+L.x1)/2;L.cy=(L.y0+L.y1)/2});
+  let ok=labels.filter(L=>L.t.length>=2&&isEnglish(L.t)&&/[a-z]/i.test(L.t)&&!HEADER.test(L.t)&&!TITLE_RE.test(L.t)&&!SKIP_TITLE.test(L.t)&&L.t.split(' ').length<=5);
+  const mh=median(ok.map(L=>L.h));
+  ok=ok.filter(L=>L.h>=mh*0.6&&L.h<=mh*1.6);   // same-size text only: drops titles, logos, text inside pictures
+  return ok;
+}
+// bounding box of the drawing inside a cell (pixels that differ from the cell's background colour)
+function inkBox(ctx,x0,y0,x1,y1){
+  x0=Math.max(0,Math.round(x0));y0=Math.max(0,Math.round(y0));x1=Math.min(ctx.canvas.width,Math.round(x1));y1=Math.min(ctx.canvas.height,Math.round(y1));
+  const W=x1-x0,H=y1-y0;if(W<12||H<12)return null;
+  const d=ctx.getImageData(x0,y0,W,H).data;
+  const border=[];const push=(x,y)=>{const i=(y*W+x)*4;border.push([d[i],d[i+1],d[i+2]])};
+  for(let x=0;x<W;x+=3){push(x,0);push(x,H-1)}for(let y=0;y<H;y+=3){push(0,y);push(W-1,y)}
+  const bg=[0,1,2].map(c=>median(border.map(p=>p[c])));
+  const cols=new Uint32Array(W),rows=new Uint32Array(H);let ink=0;
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){const i=(y*W+x)*4;
+    if(Math.abs(d[i]-bg[0])+Math.abs(d[i+1]-bg[1])+Math.abs(d[i+2]-bg[2])>70){cols[x]++;rows[y]++;ink++}}
+  const tc=Math.max(2,H*0.01),tr=Math.max(2,W*0.01);
+  let a=0,b=W-1,c=0,e=H-1;while(a<W&&cols[a]<tc)a++;while(b>a&&cols[b]<tc)b--;while(c<H&&rows[c]<tr)c++;while(e>c&&rows[e]<tr)e--;
+  if(b-a<16||e-c<16)return null;
+  // a real picture stands alone in its cell; page borders / torn-paper decorations run into the cell's side edges
+  const m=Math.max(2,Math.round(W*0.03));let side=0;for(let x=0;x<m;x++)side+=cols[x]+cols[W-1-x];
+  const touch=side/(2*m*H)>0.04;
+  return {x0:x0+a,y0:y0+c,x1:x0+b+1,y1:y0+e+1,ink:ink/(W*H),touch};
+}
+// a picture-vocabulary sheet: each word label sits under (or over) its picture → crop one picture per word
+function sheetItems(labels,ctx){
+  if(labels.length<2)return [];
+  const mh=median(labels.map(L=>L.h));
+  const rows=[];
+  labels.sort((a,b)=>a.cy-b.cy).forEach(L=>{const r=rows.find(r=>Math.abs(r.cy-L.cy)<mh*1.3);if(r){r.items.push(L);r.cy=median(r.items.map(i=>i.cy))}else rows.push({cy:L.cy,items:[L]})});
+  rows.sort((a,b)=>a.cy-b.cy);rows.forEach(r=>r.items.sort((a,b)=>a.cx-b.cx));
+  const pitch=rows.length>1?median(rows.slice(1).map((r,i)=>r.cy-rows[i].cy)):0;
+  const colGaps=[];rows.forEach(r=>r.items.slice(1).forEach((L,i)=>colGaps.push(L.cx-r.items[i].cx)));
+  const colW=median(colGaps)||ctx.canvas.width/4;
+  const cellH=pitch?pitch-mh*1.4:colW*1.1;
+  const cellsFor=(r,ri,L,i)=>{
+    const prev=r.items[i-1],next=r.items[i+1];
+    const left=prev?(prev.cx+L.cx)/2:L.cx-(next?(next.cx-L.cx)/2:colW/2);
+    const right=next?(next.cx+L.cx)/2:L.cx+(prev?(L.cx-prev.cx)/2:colW/2);
+    const upRow=rows[ri-1],downRow=rows[ri+1];
+    const aboveTop=upRow?Math.max(...upRow.items.map(o=>o.y1))+4:L.y0-cellH;
+    const belowBot=downRow?Math.min(...downRow.items.map(o=>o.y0))-4:L.y1+cellH;
+    return {above:[left,aboveTop,right,L.y0-3],below:[left,L.y1+3,right,belowBot]};
+  };
+  // decide once for the whole sheet: are pictures above or below their words?
+  // count cells holding a stand-alone picture; middle rows tie, the first/last row decide (title/footer areas)
+  const score=b=>b&&!b.touch?1:0;
+  let up=0,down=0;
+  rows.forEach((r,ri)=>r.items.forEach((L,i)=>{const c=cellsFor(r,ri,L,i);up+=score(inkBox(ctx,...c.above));down+=score(inkBox(ctx,...c.below))}));
+  const dir=down>up?'below':'above';   // tie → pictures above words (most common layout)
+  const out=[];
+  rows.forEach((r,ri)=>r.items.forEach((L,i)=>{
+    const box=inkBox(ctx,...cellsFor(r,ri,L,i)[dir]);let image=null;
+    if(box){
+      const pad=Math.round(Math.max(box.x1-box.x0,box.y1-box.y0)*0.06),x0=Math.max(0,box.x0-pad),y0=Math.max(0,box.y0-pad);
+      const w=Math.min(ctx.canvas.width,box.x1+pad)-x0,h=Math.min(ctx.canvas.height,box.y1+pad)-y0;
+      const s=Math.min(1,480/Math.max(w,h));const cv=document.createElement('canvas');cv.width=Math.round(w*s);cv.height=Math.round(h*s);
+      cv.getContext('2d').drawImage(ctx.canvas,x0,y0,w,h,0,0,cv.width,cv.height);image=cv.toDataURL('image/jpeg',.85);
+    }
+    out.push({word:L.t,ipa:'',meaning:'',pos:'',image});
+  }));
+  return out;
+}
+// one picture file → vocabulary items (a picture sheet with labels, or a photographed written list)
+async function readPictureFile(file){
+  await loadScript(TESS_URL);
+  const {cv,ctx}=await fileToCanvas(file);
+  if(!sheetWorker){sheetWorker=await Tesseract.createWorker('eng',1,{logger:ocrLogger});await sheetWorker.setParameters({tessedit_pageseg_mode:'11'})}
+  const {data}=await sheetWorker.recognize(cv);
+  const labels=wordsToLabels(data.words||[]);
+  const written=fromText(data.text||'');
+  if(written.length>=3&&written.length>=labels.length/2)return {kind:'list',items:await ocrImage(cv)};
+  return {kind:'sheet',items:sheetItems(labels,ctx)};
+}
+
+/* ---------- Fill missing phonetics (dictionaryapi.dev) and Vietnamese meanings (MyMemory) – both free, no key ---------- */
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+// free services throttle bursts: retry a few times on 429 / network errors
+async function fetchRetry(url,tries=4){
+  for(let i=0;i<tries;i++){
+    try{const r=await fetch(url);if(r.status!==429&&r.status<500)return r}catch(e){}
+    await sleep(1200*(i+1));
+  }
+  return null;
+}
+async function lookupIPA(word){
+  if(/\d/.test(word))return '';   // "Class 5A" – not a dictionary word
+  const one=async t=>{const r=await fetchRetry('https://api.dictionaryapi.dev/api/v2/entries/en/'+encodeURIComponent(t));if(!r||!r.ok)return null;
+    try{
+      const cands=[];for(const e of await r.json()){if(e.phonetic)cands.push(e.phonetic);(e.phonetics||[]).forEach(x=>x.text&&cands.push(x.text))}
+      // prefer the usual textbook form, avoid narrow transcriptions like /fʷʊʔt̚bɑɫ/
+      const odd=s=>(s.match(/[ʔ̚ʷɫ̥̩ʰⁿ̃ɾ]/g)||[]).length*3+(s.startsWith('[')?2:0)+(s.includes('ˈ')?0:1);
+      const best=cands.sort((a,b)=>odd(a)-odd(b))[0];
+      if(best)return best.replace(/^[\/\[]|[\/\]]$/g,'').trim();
+    }catch(e){}return null};
+  const q=word.toLowerCase().replace(/[?!.,]/g,'').trim();
+  const p=await one(q);if(p)return '/'+p+'/';
+  const parts=q.split(/\s+/);
+  if(parts.length>1&&parts.length<=4){const ps=[];for(const t of parts){const x=/^\d+[a-z]?$/.test(t)?t.toUpperCase():await one(t);if(!x)return '';ps.push(x)}return '/'+ps.join(' ')+'/'}
+  return '';
+}
+async function translateVi(word){
+  try{const r=await fetchRetry(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(word)}&langpair=en|vi`);if(!r||!r.ok)return '';const j=await r.json();
+    let t=(j?.responseData?.translatedText||'').trim();
+    if(!t||/MYMEMORY|QUERY LENGTH|INVALID/i.test(t)||t.toLowerCase()===word.toLowerCase())return '';
+    t=t.split(/\s*[;,]\s*/)[0].trim();                       // "thành phố,quận,huyện" → "thành phố"
+    if(word[0]===word[0].toLowerCase())t=t.toLowerCase();
+    return t;
+  }catch(e){return ''}
+}
+let enriching=false;
+async function enrichLesson(l,{quiet}={}){
+  if(enriching)return;const todo=l.words.filter(w=>!w.ipa||!w.meaning);
+  if(!todo.length){if(!quiet)toast('✅ Tất cả thẻ đã có phiên âm và nghĩa');return}
+  enriching=true;let done=0;
+  for(const w of todo){
+    if(!w.ipa)w.ipa=await lookupIPA(w.word);
+    if(!w.meaning)w.meaning=await translateVi(w.word);
+    done++;toast(`✨ Đang điền phiên âm & nghĩa… ${done}/${todo.length}`);
+    if(done%6===0){save();if(cur()===l)render()}
+  }
+  enriching=false;save();if(cur()===l)render();
+  const miss=l.words.filter(w=>!w.ipa||!w.meaning).length;
+  toast(`✅ Đã điền xong${miss?` – còn ${miss} thẻ chưa tìm được, bạn sửa tay nhé`:''}. Nghĩa dịch tự động, hãy kiểm tra lại!`);
 }
 
 async function parseFile(file){
@@ -724,9 +877,19 @@ function addLesson(title,words){
   const l={id:uid(),title,created:Date.now(),imgMode:'emoji',words};lessons.unshift(l);currentId=l.id;save();render();return l;
 }
 const isImageFile=f=>/^image\//.test(f.type)||IMG_EXT.test(f.name);
-async function handleImageFiles(imgs){
-  // 1) picture named after a word of the open lesson → becomes that card's picture
-  const l=cur();const rest=[];let matched=0;
+// add new words to a lesson; a word already there only gains the picture / missing fields
+function mergeInto(l,items){
+  let added=0;
+  for(const w of toWords(items)){
+    const ex=l.words.find(x=>x.word.toLowerCase()===w.word.toLowerCase());
+    if(ex){if(!ex.custom&&w.custom)ex.custom=w.custom;if(!ex.ipa&&w.ipa)ex.ipa=w.ipa;if(!ex.meaning&&w.meaning)ex.meaning=w.meaning}
+    else{l.words.push(w);added++}
+  }
+  return added;
+}
+async function handleImageFiles(imgs,target){
+  // 1) picture named after a word of the lesson → becomes that card's picture
+  const l=target||cur();const rest=[];let matched=0;
   for(const f of imgs){
     const n=normName(f.name);
     const w=l&&n&&l.words.find(w=>normName(w.word)===n||(w.kw&&normName(w.kw)===n)||normName(w.word).replace(/s$/,'')===n.replace(/s$/,''));
@@ -734,17 +897,26 @@ async function handleImageFiles(imgs){
     rest.push(f);
   }
   if(matched){save();render();toast(`🖼️ Đã gắn ${matched} hình vào thẻ có tên trùng`)}
-  // 2) other pictures (photo/screenshot of a word list) → read the text inside (OCR)
-  for(const f of rest){
+  if(!rest.length)return;
+  // 2) other pictures: a vocabulary sheet (pictures + labels) or a photographed word list → read them
+  const all=[];let sheets=0,lists=0;
+  for(const [k,f] of rest.entries()){
     try{
-      toast(`🔎 Đang đọc chữ trong ảnh “${f.name}” (lần đầu tải bộ đọc ~20MB)…`);
-      const items=await ocrImage(f,p=>toast(`🔎 Đang đọc chữ trong ảnh “${f.name}”… ${Math.round(p*100)}%`));
-      const words=toWords(items);
-      if(!words.length){toast(`😕 Không đọc được từ vựng trong ảnh “${f.name}”. Nếu đây là hình cho 1 từ, hãy đặt tên file trùng với từ (VD: apple.png)`);continue}
-      addLesson(f.name.replace(/\.[^.]+$/,'').replace(/[_-]+/g,' '),words);
-      toast(`✨ Đọc được ${words.length} từ từ ảnh “${f.name}” – hãy kiểm tra lại phiên âm`);
+      const tag=rest.length>1?` (${k+1}/${rest.length})`:'';
+      toast(`🔎 Đang đọc ảnh “${f.name}”${tag}… lần đầu cần tải bộ đọc chữ`);
+      ocrProgress=p=>toast(`🔎 Đang đọc ảnh “${f.name}”${tag}… ${Math.round(p*100)}%`);
+      const {kind,items}=await readPictureFile(f);
+      if(!items.length){toast(`😕 Không tìm thấy từ vựng trong ảnh “${f.name}”. Nếu đây là hình của 1 từ, hãy đặt tên file trùng với từ (VD: apple.png)`);continue}
+      kind==='sheet'?sheets++:lists++;all.push(...items);
     }catch(e){console.error(e);toast('❌ Lỗi đọc ảnh: '+e.message)}
+    finally{ocrProgress=null}
   }
+  if(!all.length)return;
+  let lesson=target,added;
+  if(lesson){added=mergeInto(lesson,all);save();currentId=lesson.id;render()}
+  else{const words=toWords(all);added=words.length;lesson=addLesson(rest.length===1?rest[0].name.replace(/\.[^.]+$/,'').replace(/[_-]+/g,' '):`Ảnh từ vựng (${rest.length} ảnh)`,words)}
+  toast(`✨ Đã thêm ${added} từ${sheets?' kèm hình cắt từ ảnh':''} – đang tự điền phiên âm & nghĩa…`);
+  await enrichLesson(lesson,{quiet:true});
 }
 async function handleFiles(files){
   const imgs=files.filter(isImageFile);
@@ -823,6 +995,9 @@ addEventListener('dragleave',()=>{if(--dragDepth<=0){dragDepth=0;document.body.c
 addEventListener('dragover',e=>e.preventDefault());
 addEventListener('drop',e=>{e.preventDefault();dragDepth=0;document.body.classList.remove('dragging');if(e.dataTransfer.files.length)handleFiles([...e.dataTransfer.files])});
 $('#newBtn').onclick=()=>{const l={id:uid(),title:'Bài học mới',created:Date.now(),imgMode:'emoji',words:[]};lessons.unshift(l);currentId=l.id;save();render();$('#titleInput').select()};
+$('#addPicsBtn').onclick=()=>{const l=cur();if(!l)return;const inp=document.createElement('input');inp.type='file';inp.accept='image/*';inp.multiple=true;
+  inp.onchange=()=>{if(inp.files.length)handleImageFiles([...inp.files],l)};inp.click()};
+$('#enrichBtn').onclick=()=>{const l=cur();if(l)enrichLesson(l)};
 $('#titleInput').onchange=e=>{cur().title=e.target.value.trim()||'Bài học';save();render()};
 $('#delLessonBtn').onclick=()=>{const l=cur();if(!confirm(`Xoá bài “${l.title}”?`))return;lessons=lessons.filter(x=>x!==l);currentId=lessons[0]?.id||null;save();render()};
 document.querySelectorAll('#imgSeg button').forEach(b=>b.onclick=()=>{cur().imgMode=b.dataset.v;save();render()});
@@ -1009,7 +1184,7 @@ function vCard(x,w,img,t,dur,i,n){
   x.shadowColor='#0009';x.shadowBlur=40;x.fillStyle='#fff';rr(x,0,0,W,H,34);x.fill();x.shadowBlur=0;
   x.strokeStyle='#ffc83d';x.lineWidth=6;rr(x,-4,-4,W+8,H+8,38);x.stroke();
   x.save();rr(x,22,22,W-44,W-44,22);x.clip();
-  if(img){const s=Math.max((W-44)/img.width,(W-44)/img.height);x.drawImage(img,22+(W-44-img.width*s)/2,22+(W-44-img.height*s)/2,img.width*s,img.height*s)}
+  if(img){const s=w.custom?Math.min((W-44)/img.width,(W-44)/img.height)*.92:Math.max((W-44)/img.width,(W-44)/img.height);x.drawImage(img,22+(W-44-img.width*s)/2,22+(W-44-img.height*s)/2,img.width*s,img.height*s)}
   else{const em=emojiFor(termOf(w));const gg=x.createRadialGradient(W/2,W/2,10,W/2,W/2,W/2);gg.addColorStop(0,'#fff');gg.addColorStop(1,colorOf(w.word)+'55');x.fillStyle=gg;x.fillRect(22,22,W-44,W-44);
     x.textAlign='center';x.textBaseline='middle';if(em){x.font='200px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji"';x.fillText(em,W/2,W/2+10)}else{x.fillStyle=colorOf(w.word);x.font='800 220px "Baloo 2"';x.fillText(w.word[0].toUpperCase(),W/2,W/2+10)}x.textBaseline='alphabetic'}
   x.restore();
