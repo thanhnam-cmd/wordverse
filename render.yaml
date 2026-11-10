@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: wordverse
+    runtime: static
+    buildCommand: echo "static site - no build"
+    staticPublishPath: ./
+    headers:
+      - path: /*
+        name: Cache-Control
+        value: no-cache
