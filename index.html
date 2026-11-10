@@ -292,7 +292,7 @@ body.dragging::after{content:'🪐 Thả file vào đây!';position:fixed;inset:
 <div class="modal hidden" id="videoModal">
   <div class="box">
     <h3>🎬 Xuất video bài học</h3>
-    <p class="hint">Video gồm màn mở đầu, từng thẻ (hình → từ → phiên âm → nghĩa) và màn kết. Giữ tab này mở trong khi quay.</p>
+    <p class="hint">Video gồm màn mở đầu, từng thẻ (hình → từ → phiên âm → nghĩa) và màn kết. Video đọc từng từ bằng giọng tổng hợp tiếng Anh. Giữ tab này mở trong khi quay.</p>
     <canvas id="vCanvas" width="1280" height="720"></canvas>
     <div class="row">
       <label>Giây mỗi thẻ <input type="number" id="vSec" value="4" min="2" max="15"></label>
@@ -696,7 +696,7 @@ async function fileToCanvas(file,max=2400){
 const median=a=>{if(!a.length)return 0;const s=[...a].sort((x,y)=>x-y);return s[Math.floor(s.length/2)]};
 // group OCR words that sit on one line close together into labels ("table" + "tennis" → "table tennis")
 function wordsToLabels(words){
-  const ws=words.filter(w=>w.confidence>=75&&w.text.trim()).map(w=>({t:w.text.trim(),x0:w.bbox.x0,y0:w.bbox.y0,x1:w.bbox.x1,y1:w.bbox.y1}))
+  const ws=words.filter(w=>w.confidence>=45&&w.text.trim()).map(w=>({t:w.text.trim(),x0:w.bbox.x0,y0:w.bbox.y0,x1:w.bbox.x1,y1:w.bbox.y1}))
     .sort((a,b)=>a.x0-b.x0);
   const labels=[];
   for(const w of ws){
@@ -708,8 +708,6 @@ function wordsToLabels(words){
   }
   labels.forEach(L=>{L.t=L.t.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9?!.)]+$/g,'').replace(/\s+/g,' ').trim();L.h=L.y1-L.y0;L.cx=(L.x0+L.x1)/2;L.cy=(L.y0+L.y1)/2});
   let ok=labels.filter(L=>L.t.length>=2&&isEnglish(L.t)&&/[a-z]/i.test(L.t)&&!HEADER.test(L.t)&&!TITLE_RE.test(L.t)&&!SKIP_TITLE.test(L.t)&&L.t.split(' ').length<=5);
-  const mh=median(ok.map(L=>L.h));
-  ok=ok.filter(L=>L.h>=mh*0.6&&L.h<=mh*1.6);   // same-size text only: drops titles, logos, text inside pictures
   return ok;
 }
 // bounding box of the drawing inside a cell (pixels that differ from the cell's background colour)
@@ -733,14 +731,14 @@ function inkBox(ctx,x0,y0,x1,y1){
 }
 // a picture-vocabulary sheet: each word label sits under (or over) its picture → crop one picture per word
 function sheetItems(labels,ctx){
-  if(labels.length<2)return [];
+  if(!labels.length)return [];
   const mh=median(labels.map(L=>L.h));
   const rows=[];
   labels.sort((a,b)=>a.cy-b.cy).forEach(L=>{const r=rows.find(r=>Math.abs(r.cy-L.cy)<mh*1.3);if(r){r.items.push(L);r.cy=median(r.items.map(i=>i.cy))}else rows.push({cy:L.cy,items:[L]})});
   rows.sort((a,b)=>a.cy-b.cy);rows.forEach(r=>r.items.sort((a,b)=>a.cx-b.cx));
   const pitch=rows.length>1?median(rows.slice(1).map((r,i)=>r.cy-rows[i].cy)):0;
   const colGaps=[];rows.forEach(r=>r.items.slice(1).forEach((L,i)=>colGaps.push(L.cx-r.items[i].cx)));
-  const colW=median(colGaps)||ctx.canvas.width/4;
+  const colW=median(colGaps)||ctx.canvas.width/(labels.length===1?1:4);
   const cellH=pitch?pitch-mh*1.4:colW*1.1;
   const cellsFor=(r,ri,L,i)=>{
     const prev=r.items[i-1],next=r.items[i+1];
@@ -775,10 +773,29 @@ async function readPictureFile(file){
   await loadScript(TESS_URL);
   const {cv,ctx}=await fileToCanvas(file);
   if(!sheetWorker){sheetWorker=await Tesseract.createWorker('eng',1,{logger:ocrLogger});await sheetWorker.setParameters({tessedit_pageseg_mode:'11'})}
-  const {data}=await sheetWorker.recognize(cv);
-  const labels=wordsToLabels(data.words||[]);
-  const written=fromText(data.text||'');
-  if(written.length>=3&&written.length>=labels.length/2)return {kind:'list',items:await ocrImage(cv)};
+  const batches=[];
+  for(const mode of ['11','3','6']){
+    await sheetWorker.setParameters({tessedit_pageseg_mode:mode});
+    const {data}=await sheetWorker.recognize(cv);
+    batches.push(wordsToLabels(data.words||[]));
+  }
+  const labels=[];
+  for(const batch of batches.sort((a,b)=>b.length-a.length)){
+    for(const label of batch){
+      if(!labels.some(other=>Math.min(label.x1,other.x1)>Math.max(label.x0,other.x0)&&
+        Math.min(label.y1,other.y1)-Math.max(label.y0,other.y0)>Math.min(label.h,other.h)*.5))labels.push(label);
+    }
+  }
+  const list=await ocrImage(cv);
+  const sheet=sheetItems(labels,ctx);
+  if(list.length){
+    for(const item of list){
+      const match=sheet.find(candidate=>normName(candidate.word)===normName(item.word));
+      if(match?.image)item.image=match.image;
+    }
+    const known=new Set(list.map(item=>normName(item.word)));
+    return {kind:'list',items:[...list,...sheet.filter(item=>!known.has(normName(item.word)))]};
+  }
   return {kind:'sheet',items:sheetItems(labels,ctx)};
 }
 
@@ -874,7 +891,7 @@ function toWords(items){
   return [...map.values()];
 }
 function addLesson(title,words){
-  const l={id:uid(),title,created:Date.now(),imgMode:'emoji',words};lessons.unshift(l);currentId=l.id;save();render();return l;
+  const l={id:uid(),title,created:Date.now(),imgMode:'photo',words};lessons.unshift(l);currentId=l.id;save();render();return l;
 }
 const isImageFile=f=>/^image\//.test(f.type)||IMG_EXT.test(f.name);
 // add new words to a lesson; a word already there only gains the picture / missing fields
@@ -965,6 +982,11 @@ function wordCard(l,w,i){
   const tools=document.createElement('div');tools.className='tools';
   const m=modeOf(l);
   tools.innerHTML=`${m!=='emoji'&&!w.custom?'<button data-a="new" title="Đổi hình khác">🎲</button>':''}<button data-a="up" title="Tải ảnh của bạn">🖼️</button>${w.custom?'<button data-a="reset" title="Bỏ ảnh tự tải">↩️</button>':''}`;
+  const google=document.createElement('button');
+  google.textContent='🔎';
+  google.title='Tìm trên Google Hình ảnh';
+  google.onclick=()=>window.open('https://www.google.com/search?tbm=isch&q='+encodeURIComponent(termOf(w)),'_blank','noopener,noreferrer');
+  tools.appendChild(google);
   pic.appendChild(tools);
   tools.onclick=e=>{const a=e.target.dataset.a;if(!a)return;
     if(a==='up')return pickImage(w);
@@ -1207,17 +1229,66 @@ $('#vStart').onclick=async()=>{
   if(recording)return;const l=cur();const cv=$('#vCanvas'),x=cv.getContext('2d');
   if(!window.MediaRecorder||!cv.captureStream)return toast('Trình duyệt không hỗ trợ quay video – hãy dùng Chrome hoặc Edge');
   recording=true;$('#vStart').disabled=true;$('#vStatus').textContent='Đang chuẩn bị hình ảnh…';
-  const imgs=[];for(let i=0;i<l.words.length;i++){imgs.push(await loadCors(await resolveSrc(l.words[i],l)));$('#vBar').style.width=(i+1)/l.words.length*100+'%';if(!recording)break}
-  if(!recording){$('#vStart').disabled=false;return}
-  const dur=Math.max(2,+$('#vSec').value||4),INTRO=2.5,OUTRO=2.5,total=INTRO+dur*l.words.length+OUTRO;
-  const mime=['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp9','video/webm'].find(m=>MediaRecorder.isTypeSupported(m));
-  const rec=new MediaRecorder(cv.captureStream(30),{mimeType:mime,videoBitsPerSecond:5e6});const chunks=[];
+  let context,stream,rec;
+  const cleanup=()=>{
+    stream?.getTracks().forEach(track=>track.stop());
+    context?.close().catch(()=>{});
+    recording=false;
+    $('#vStart').disabled=false;
+  };
+  try{
+  context=new AudioContext();
+  await context.resume();
+  $('#vStatus').textContent='Đang tải giọng đọc video…';
+  const base='https://cdn.jsdelivr.net/gh/foxdog-studios/meSpeak@master/';
+  await loadScript(base+'mespeak.full.js');
+  const engine=window.meSpeak;
+  if(!engine)throw new Error('Không tải được bộ đọc video');
+  const loadData=async path=>{
+    const response=await fetch(base+path,{signal:AbortSignal.timeout(20000)});
+    if(!response.ok)throw new Error('Không tải được dữ liệu giọng đọc');
+    return response.json();
+  };
+  if(!engine.isConfigLoaded())engine.loadConfig(await loadData('mespeak_config.json'));
+  if(!engine.isVoiceLoaded('en/en-us'))engine.loadVoice(await loadData('voices/en/en-us.json'));
+  const imgs=[],sounds=[];
+  for(const [i,word] of l.words.entries()){
+    if(!recording){cleanup();return}
+    $('#vStatus').textContent='Đang chuẩn bị hình và giọng đọc '+(i+1)+'/'+l.words.length;
+    imgs.push(await loadCors(await resolveSrc(word,l)));
+    const wav=engine.speak(word.word,{rawdata:true,speed:Math.round(175*(settings.rate||.85))});
+    if(!(wav instanceof ArrayBuffer)||!wav.byteLength)throw new Error('Không tạo được tiếng đọc cho '+word.word);
+    sounds.push(await context.decodeAudioData(wav));
+  }
+  if(!recording){cleanup();return}
+  const dur=Math.max(2,+$('#vSec').value||4,...sounds.map(sound=>sound.duration+1));
+  const INTRO=2.5,OUTRO=2.5,total=INTRO+dur*l.words.length+OUTRO;
+  const output=context.createMediaStreamDestination();
+  stream=cv.captureStream(30);
+  for(const track of output.stream.getAudioTracks())stream.addTrack(track);
+  const mime=['video/mp4;codecs=avc1,mp4a.40.2','video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus'].find(m=>MediaRecorder.isTypeSupported(m));
+  if(!mime)throw new Error('Trình duyệt không hỗ trợ định dạng video có tiếng');
+  rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:5e6});
+  const chunks=[];
   rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
-  rec.onstop=()=>{$('#vStart').disabled=false;if(!recording){$('#vStatus').textContent='Đã huỷ';return}const ext=mime.includes('mp4')?'mp4':'webm';
+  rec.onstop=()=>{const completed=recording;cleanup();if(!completed){$('#vStatus').textContent='Đã huỷ';return}const ext=mime.includes('mp4')?'mp4':'webm';
     const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(chunks,{type:mime}));a.download=l.title.replace(/[^\p{L}\p{N} _-]/gu,'')+'.'+ext;a.click();
     $('#vStatus').textContent='✅ Đã lưu video .'+ext;recording=false};
+  rec.onerror=()=>{
+    rec.onstop=null;
+    cleanup();
+    $('#vStatus').textContent='Không ghi được video có tiếng';
+  };
   rec.start(500);const t0=performance.now();
+  const audioStart=context.currentTime;
+  sounds.forEach((sound,i)=>{
+    const source=context.createBufferSource();
+    source.buffer=sound;
+    source.connect(output);
+    source.start(audioStart+INTRO+i*dur+.25);
+  });
   (function frame(){
+    if(rec.state==='inactive')return
     if(!recording){rec.stop();return}
     const t=(performance.now()-t0)/1000;
     if(t<INTRO)vTitle(x,t,l.title,l.words.length);
@@ -1227,6 +1298,11 @@ $('#vStart').onclick=async()=>{
     if(t>=total){rec.stop();return}
     requestAnimationFrame(frame);
   })();
+  }catch(error){
+    if(rec&&rec.state!=='inactive'){rec.onstop=null;rec.stop()}
+    cleanup();
+    $('#vStatus').textContent='❌ '+error.message;
+  }
 };
 
 /* init */
