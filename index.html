@@ -1244,13 +1244,15 @@ $('#vStart').onclick=async()=>{
   await loadScript(base+'mespeak.full.js');
   const engine=window.meSpeak;
   if(!engine)throw new Error('Không tải được bộ đọc video');
-  const loadData=async path=>{
-    const response=await fetch(base+path,{signal:AbortSignal.timeout(20000)});
-    if(!response.ok)throw new Error('Không tải được dữ liệu giọng đọc');
-    return response.json();
-  };
-  if(!engine.isConfigLoaded())engine.loadConfig(await loadData('mespeak_config.json'));
-  if(!engine.isVoiceLoaded('en/en-us'))engine.loadVoice(await loadData('voices/en/en-us.json'));
+  // This version of meSpeak loads JSON from URLs and completes asynchronously.
+  if(!engine.isConfigLoaded())engine.loadConfig(base+'mespeak_config.json');
+  if(!engine.isVoiceLoaded('en/en-us'))engine.loadVoice(base+'voices/en/en-us.json');
+  const deadline=performance.now()+20000;
+  while(!engine.isConfigLoaded()||!engine.isVoiceLoaded('en/en-us')){
+    if(!recording){cleanup();return}
+    if(performance.now()>=deadline)throw new Error('Không tải được dữ liệu giọng đọc tiếng Anh');
+    await new Promise(resolve=>setTimeout(resolve,50));
+  }
   const imgs=[],sounds=[];
   for(const [i,word] of l.words.entries()){
     if(!recording){cleanup();return}
@@ -1258,7 +1260,12 @@ $('#vStart').onclick=async()=>{
     imgs.push(await loadCors(await resolveSrc(word,l)));
     const wav=engine.speak(word.word,{rawdata:true,speed:Math.round(175*(settings.rate||.85))});
     if(!(wav instanceof ArrayBuffer)||!wav.byteLength)throw new Error('Không tạo được tiếng đọc cho '+word.word);
-    sounds.push(await context.decodeAudioData(wav));
+    const sound=await context.decodeAudioData(wav);
+    const samples=sound.getChannelData(0);
+    if(!samples.some(sample=>Math.abs(sample)>.001)){
+      throw new Error('Giọng đọc của “'+word.word+'” không có tín hiệu âm thanh');
+    }
+    sounds.push(sound);
   }
   if(!recording){cleanup();return}
   const dur=Math.max(2,+$('#vSec').value||4,...sounds.map(sound=>sound.duration+1));
@@ -1266,31 +1273,40 @@ $('#vStart').onclick=async()=>{
   const output=context.createMediaStreamDestination();
   stream=cv.captureStream(30);
   for(const track of output.stream.getAudioTracks())stream.addTrack(track);
-  const mime=['video/mp4;codecs=avc1,mp4a.40.2','video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus'].find(m=>MediaRecorder.isTypeSupported(m));
+  const mime=['video/webm;codecs=vp8,opus','video/webm;codecs=vp9,opus','video/mp4;codecs=avc1,mp4a.40.2'].find(m=>MediaRecorder.isTypeSupported(m));
   if(!mime)throw new Error('Trình duyệt không hỗ trợ định dạng video có tiếng');
   rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:5e6});
   const chunks=[];
   rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
   rec.onstop=()=>{const completed=recording;cleanup();if(!completed){$('#vStatus').textContent='Đã huỷ';return}const ext=mime.includes('mp4')?'mp4':'webm';
-    const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(chunks,{type:mime}));a.download=l.title.replace(/[^\p{L}\p{N} _-]/gu,'')+'.'+ext;a.click();
+    if(!chunks.length){$('#vStatus').textContent='Không ghi được dữ liệu video';return}
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob(chunks,{type:rec.mimeType||mime}));
+    a.download=(l.title.replace(/[^\p{L}\p{N} _-]/gu,'')||'WordVerse')+'.'+ext;
+    a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),60000);
     $('#vStatus').textContent='✅ Đã lưu video .'+ext;recording=false};
   rec.onerror=()=>{
     rec.onstop=null;
     cleanup();
     $('#vStatus').textContent='Không ghi được video có tiếng';
   };
-  rec.start(500);const t0=performance.now();
+  // Use the same audio clock for both the narration and the card transitions.
+  await context.resume();
+  if(!recording){cleanup();return}
+  rec.start(500);
   const audioStart=context.currentTime;
   sounds.forEach((sound,i)=>{
     const source=context.createBufferSource();
     source.buffer=sound;
     source.connect(output);
+    source.connect(context.destination);
     source.start(audioStart+INTRO+i*dur+.25);
   });
   (function frame(){
     if(rec.state==='inactive')return
     if(!recording){rec.stop();return}
-    const t=(performance.now()-t0)/1000;
+    const t=context.currentTime-audioStart;
     if(t<INTRO)vTitle(x,t,l.title,l.words.length);
     else if(t<INTRO+dur*l.words.length){const k=Math.floor((t-INTRO)/dur);vCard(x,l.words[k],imgs[k],(t-INTRO)-k*dur,dur,k,l.words.length)}
     else vTitle(x,t-INTRO-dur*l.words.length,'',l.words.length,true);
