@@ -143,7 +143,10 @@ body.dragging::after{content:'🪐 Thả file vào đây!';position:fixed;inset:
 .deck.empty .back{opacity:.15;border-style:dashed}
 .deck:not(.empty):hover .back:last-child{transform:translateY(-1.2vh) rotate(-2deg)}
 
-.slot{position:relative;height:min(70vh,64vw);aspect-ratio:3/4}
+.slot{position:relative;height:min(62vh,56vw);aspect-ratio:3/4}
+.stage-meaning{position:absolute;top:calc(100% + 1.2vh);left:50%;transform:translateX(-50%);width:min(48vw,680px);max-height:10vh;overflow:auto;text-align:center;color:var(--gold);font:800 clamp(16px,3.4vh,42px) 'Baloo 2';line-height:1.2;overflow-wrap:anywhere}
+.slot .speak{left:auto;right:-8vh;bottom:0;transform:none}
+@media(max-width:600px){.stage-meaning{width:46vw;font-size:clamp(14px,2.8vh,24px)}.slot .speak{right:0;bottom:1vh}}
 .slot .placeholder{position:absolute;inset:0;border-radius:3.2vh;border:.5vh dashed #ffffff30;display:grid;place-items:center;text-align:center;color:var(--muted);font:700 clamp(16px,2vw,30px) 'Baloo 2';padding:2vw}
 .flip{position:absolute;inset:0;transform-style:preserve-3d;transition:transform .7s cubic-bezier(.3,1.4,.5,1);cursor:pointer}
 .flip.turned{transform:rotateY(180deg)}
@@ -1091,7 +1094,10 @@ function drawStage(anim){
   f.querySelector('.pic').appendChild(visualEl(w,l));
   f.onclick=()=>{f.classList.remove('deal','backin');f.classList.toggle('turned')};
   slot.appendChild(f);
-  const tap=document.createElement('div');tap.className='tag-tap';tap.textContent='👆 chạm thẻ để xem nghĩa';slot.appendChild(tap);
+  const meaning=document.createElement('div');
+  meaning.className='stage-meaning';
+  meaning.textContent=w.meaning||'Chưa có nghĩa tiếng Việt';
+  slot.appendChild(meaning);
   const sp=document.createElement('button');sp.className='speak';sp.textContent='🔊';sp.title='Nghe phát âm';sp.onclick=e=>{e.stopPropagation();speak(w.word,true)};slot.appendChild(sp);
   if(autoTimer){const b=document.createElement('div');b.className='auto-bar';slot.appendChild(b);b.animate([{width:'0'},{width:'100%'}],{duration:AUTO_MS,easing:'linear'})}
   if(settings.sound){const at=idx;setTimeout(()=>{if(idx===at&&!$('#stage').classList.contains('hidden'))speak(w.word)},anim==='deal'?900:200)}
